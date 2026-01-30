@@ -1,71 +1,51 @@
-# 🎨 Churn Prediction Dashboard
+# 📊 Customer Churn Prediction Dashboard
 
-React + Tailwind CSS frontend for customer churn analytics.
+Streamlit-based interactive dashboard for customer churn analytics.
 
 ## 🚀 Quick Start
 
-```bash
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
+```powershell
+cd frontend
+pip install -r requirements.txt
+streamlit run app.py
 ```
+
+Dashboard opens at: **http://localhost:8501**
+
+## 📱 Features
+
+| Page | Description |
+|------|-------------|
+| 📊 Dashboard | KPIs, risk charts, customer segments |
+| 👥 Customers | Search, filter, view customer details |
+| 🔮 Predict Churn | Input form with live prediction |
+| 🎯 Retention Actions | Priority-based action list |
+| 📈 Model Performance | Model comparison & feature importance |
 
 ## 📁 Project Structure
 
 ```
 frontend/
-├── src/
-│   ├── components/
-│   │   ├── Dashboard/
-│   │   │   ├── KpiCard.jsx
-│   │   │   ├── RiskChart.jsx
-│   │   │   └── SegmentChart.jsx
-│   │   ├── Customers/
-│   │   │   ├── CustomerTable.jsx
-│   │   │   ├── CustomerDetail.jsx
-│   │   │   └── Filters.jsx
-│   │   ├── Explainability/
-│   │   │   ├── ShapChart.jsx
-│   │   │   └── FeatureImpact.jsx
-│   │   ├── Retention/
-│   │   │   ├── ActionList.jsx
-│   │   │   └── PriorityBadge.jsx
-│   │   └── Layout/
-│   │       ├── Sidebar.jsx
-│   │       ├── Topbar.jsx
-│   │       └── MainLayout.jsx
-│   ├── pages/
-│   │   ├── Dashboard.jsx
-│   │   ├── Customers.jsx
-│   │   ├── Retention.jsx
-│   │   └── Settings.jsx
-│   ├── services/
-│   │   └── api.js
-│   ├── App.jsx
-│   └── main.jsx
-├── public/
-├── index.html
-├── package.json
-├── tailwind.config.js
-└── vite.config.js
+├── app.py              # Main Streamlit application
+├── requirements.txt    # Python dependencies
+└── README.md          # This file
 ```
 
 ## 🛠️ Tech Stack
 
-- React 18
-- Vite
-- Tailwind CSS
-- Recharts (charts)
-- Axios (API calls)
-- React Router
+- Streamlit
+- Pandas
+- Plotly
+- Requests (API calls)
 
-## 🔧 Environment Variables
+## 🔌 API Integration
 
-Create a `.env` file:
-```env
-VITE_API_URL=http://localhost:8000
+The dashboard connects to the FastAPI backend at `http://localhost:8000`.
+Start the backend first for full functionality:
+
+```powershell
+cd ../backend/api
+uvicorn main:app --reload --port 8000
 ```
 
 ## 📜 License
