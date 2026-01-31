@@ -1,6 +1,6 @@
 """
 Customer Churn Prediction Dashboard
-Streamlit-based interactive dashboard
+Streamlit-based interactive dashboard with user authentication and dataset upload
 """
 
 import streamlit as st
@@ -9,6 +9,28 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+import os
+from pathlib import Path
+from datetime import datetime
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def get_project_root():
+    """Get project root directory dynamically"""
+    if os.getenv("PROJECT_ROOT"):
+        return Path(os.getenv("PROJECT_ROOT"))
+    return Path(__file__).parent.parent
+
+PROJECT_ROOT = get_project_root()
+DATA_PATH = Path(os.getenv("DATA_PATH", PROJECT_ROOT / "data" / "processed"))
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+
+# File paths
+PREDICTIONS_FILE = DATA_PATH / "customer_predictions.csv"
+RETENTION_FILE = DATA_PATH / "retention_actions.csv"
+MODEL_COMPARISON_FILE = DATA_PATH / "model_comparison.csv"
 
 # Page Configuration
 st.set_page_config(
@@ -32,45 +54,516 @@ st.markdown("""
     .risk-high { color: #f39c12; font-weight: bold; }
     .risk-medium { color: #f1c40f; font-weight: bold; }
     .risk-low { color: #2ecc71; font-weight: bold; }
+    .profit { color: #2ecc71; font-size: 1.5rem; font-weight: bold; }
+    .loss { color: #e74c3c; font-size: 1.5rem; font-weight: bold; }
+    .auth-container {
+        max-width: 400px;
+        margin: 0 auto;
+        padding: 2rem;
+        background: #f8f9fa;
+        border-radius: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# API Base URL
-API_URL = "http://localhost:8000"
 
-# Helper Functions
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'token' not in st.session_state:
+    st.session_state.token = None
+if 'user' not in st.session_state:
+    st.session_state.user = None
+if 'current_analysis' not in st.session_state:
+    st.session_state.current_analysis = None
+
+
+# ============================================================================
+# API HELPER FUNCTIONS
+# ============================================================================
+
+def api_request(method, endpoint, data=None, files=None, auth=True):
+    """Make API request with optional authentication"""
+    headers = {}
+    if auth and st.session_state.token:
+        headers["Authorization"] = f"Bearer {st.session_state.token}"
+    
+    url = f"{API_URL}{endpoint}"
+    
+    try:
+        if method == "GET":
+            response = requests.get(url, headers=headers, timeout=30)
+        elif method == "POST":
+            if files:
+                response = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+            else:
+                response = requests.post(url, headers=headers, json=data, timeout=30)
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers, timeout=30)
+        else:
+            return None
+        
+        if response.status_code in [200, 201]:
+            return response.json()
+        elif response.status_code == 401:
+            st.session_state.authenticated = False
+            st.session_state.token = None
+            return {"error": "Unauthorized. Please login again."}
+        else:
+            # Try to get error detail, but handle non-JSON responses
+            try:
+                error_detail = response.json().get("detail", "Unknown error")
+            except:
+                error_detail = response.text or f"HTTP {response.status_code}"
+            return {"error": error_detail}
+    except requests.exceptions.ConnectionError:
+        return {"error": "Cannot connect to API. Make sure the backend is running."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def register_user(email, username, password, full_name=None, company=None):
+    """Register a new user"""
+    data = {
+        "email": email,
+        "username": username,
+        "password": password,
+        "full_name": full_name,
+        "company": company
+    }
+    return api_request("POST", "/auth/register", data, auth=False)
+
+
+def login_user(email, password):
+    """Login user and get token"""
+    data = {"email": email, "password": password}
+    result = api_request("POST", "/auth/login-json", data, auth=False)
+    
+    if result and "access_token" in result:
+        st.session_state.token = result["access_token"]
+        st.session_state.authenticated = True
+        # Get user info
+        user_info = api_request("GET", "/auth/me")
+        if user_info and "error" not in user_info:
+            st.session_state.user = user_info
+        return True
+    return False
+
+
+def logout_user():
+    """Logout current user"""
+    st.session_state.authenticated = False
+    st.session_state.token = None
+    st.session_state.user = None
+    st.session_state.current_analysis = None
+
+
+def upload_dataset(file, description=None):
+    """Upload dataset for analysis"""
+    files = {"file": (file.name, file, "text/csv")}
+    data = {"description": description} if description else {}
+    return api_request("POST", "/datasets/upload", data=data, files=files)
+
+
+def get_dataset_history(limit=10):
+    """Get user's dataset upload history"""
+    return api_request("GET", f"/datasets/history?limit={limit}")
+
+
+def compare_latest_datasets():
+    """Compare the latest two datasets"""
+    return api_request("GET", "/datasets/compare/latest")
+
+
+def compare_datasets(dataset_1_id, dataset_2_id):
+    """Compare two specific datasets"""
+    data = {"dataset_1_id": dataset_1_id, "dataset_2_id": dataset_2_id}
+    return api_request("POST", "/datasets/compare", data)
+
+
+# ============================================================================
+# PAGE: LOGIN / REGISTER
+# ============================================================================
+
+def show_auth_page():
+    """Show authentication page"""
+    st.markdown('<h1 class="main-header">🔐 Welcome to Churn Prediction</h1>', unsafe_allow_html=True)
+    
+    tab1, tab2 = st.tabs(["🔑 Login", "📝 Register"])
+    
+    with tab1:
+        st.markdown("### Login to Your Account")
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="you@company.com")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login", use_container_width=True)
+            
+            if submit:
+                if email and password:
+                    if login_user(email, password):
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid email or password")
+                else:
+                    st.warning("Please enter email and password")
+    
+    with tab2:
+        st.markdown("### Create New Account")
+        with st.form("register_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                reg_email = st.text_input("Email*", placeholder="you@company.com")
+                reg_username = st.text_input("Username*", placeholder="johndoe")
+            with col2:
+                reg_fullname = st.text_input("Full Name", placeholder="John Doe")
+                reg_company = st.text_input("Company", placeholder="Acme Inc")
+            
+            reg_password = st.text_input("Password*", type="password")
+            reg_password2 = st.text_input("Confirm Password*", type="password")
+            
+            register = st.form_submit_button("Create Account", use_container_width=True)
+            
+            if register:
+                if not all([reg_email, reg_username, reg_password]):
+                    st.warning("Please fill in all required fields")
+                elif reg_password != reg_password2:
+                    st.error("Passwords do not match")
+                elif len(reg_password) < 6:
+                    st.error("Password must be at least 6 characters")
+                else:
+                    result = register_user(reg_email, reg_username, reg_password, reg_fullname, reg_company)
+                    if result and "error" not in result:
+                        st.success("✅ Account created! Please login.")
+                    elif result and "error" in result:
+                        st.error(f"❌ {result['error']}")
+                    else:
+                        st.error("❌ Registration failed")
+
+
+# ============================================================================
+# PAGE: UPLOAD DATASET
+# ============================================================================
+
+def show_upload_page():
+    """Show dataset upload and analysis page"""
+    st.markdown('<h1 class="main-header">📤 Upload Your Dataset</h1>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    Upload your customer data in CSV format. The system will:
+    1. **Analyze** your dataset using our ML model
+    2. **Predict** churn probability for each customer
+    3. **Store** results for future comparison
+    4. **Compare** with previous uploads to track progress
+    """)
+    
+    st.markdown("---")
+    
+    # File Upload Section
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        uploaded_file = st.file_uploader(
+            "Upload Customer CSV",
+            type=["csv"],
+            help="Upload a CSV file with customer data"
+        )
+        description = st.text_input(
+            "Description (optional)",
+            placeholder="e.g., Q1 2024 Customer Data"
+        )
+    
+    with col2:
+        st.markdown("**Expected Columns:**")
+        st.markdown("""
+        - CustomerID
+        - Gender
+        - SeniorCitizen
+        - Partner, Dependents
+        - Tenure
+        - PhoneService
+        - InternetService
+        - Contract
+        - MonthlyCharges
+        - TotalCharges
+        """)
+    
+    if uploaded_file:
+        # Preview uploaded file
+        st.markdown("### 📋 Data Preview")
+        try:
+            df_preview = pd.read_csv(uploaded_file)
+            st.dataframe(df_preview.head(10), use_container_width=True)
+            st.info(f"📊 Total rows: {len(df_preview):,} | Columns: {len(df_preview.columns)}")
+            
+            # Reset file pointer for upload
+            uploaded_file.seek(0)
+            
+            if st.button("🚀 Analyze Dataset", type="primary", use_container_width=True):
+                with st.spinner("Analyzing dataset..."):
+                    result = upload_dataset(uploaded_file, description)
+                
+                if result and "error" not in result:
+                    st.session_state.current_analysis = result
+                    st.success("✅ Dataset analyzed successfully!")
+                    st.rerun()
+                elif result and "error" in result:
+                    st.error(f"❌ Error: {result['error']}")
+                else:
+                    st.error("❌ Failed to analyze dataset")
+        except Exception as e:
+            st.error(f"❌ Error reading file: {e}")
+    
+    # Show Current Analysis Results
+    if st.session_state.current_analysis:
+        analysis = st.session_state.current_analysis
+        
+        st.markdown("---")
+        st.markdown("### 📊 Analysis Results")
+        
+        # KPI Cards
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Customers", f"{analysis.get('total_customers', 0):,}")
+        with col2:
+            st.metric("Churn Rate", f"{analysis.get('churn_rate', 0):.1f}%")
+        with col3:
+            st.metric("High Risk", f"{analysis.get('high_risk_count', 0):,}")
+        with col4:
+            st.metric("Revenue at Risk", f"${analysis.get('revenue_at_risk', 0):,.0f}")
+        
+        # Risk Distribution
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🎯 Risk Distribution")
+            segment_stats = analysis.get('segment_stats', {})
+            if segment_stats:
+                risk_data = pd.DataFrame([
+                    {"Risk Level": level, "Count": stats.get('count', 0)}
+                    for level, stats in segment_stats.items()
+                ])
+                fig = px.pie(
+                    risk_data, values='Count', names='Risk Level',
+                    color='Risk Level',
+                    color_discrete_map={
+                        'Low': '#2ecc71', 'Medium': '#f1c40f',
+                        'High': '#f39c12', 'Critical': '#e74c3c'
+                    },
+                    hole=0.4
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.subheader("📈 Key Insights")
+            churn_rate = analysis.get('churn_rate', 0)
+            if churn_rate > 30:
+                st.error(f"⚠️ High churn risk detected ({churn_rate:.1f}%)")
+                st.markdown("- Consider immediate retention campaigns")
+                st.markdown("- Review high-risk customer segments")
+            elif churn_rate > 15:
+                st.warning(f"⚡ Moderate churn risk ({churn_rate:.1f}%)")
+                st.markdown("- Monitor at-risk customers")
+                st.markdown("- Implement proactive engagement")
+            else:
+                st.success(f"✅ Low churn risk ({churn_rate:.1f}%)")
+                st.markdown("- Continue current strategies")
+                st.markdown("- Focus on customer satisfaction")
+
+
+# ============================================================================
+# PAGE: HISTORY & COMPARISON
+# ============================================================================
+
+def show_comparison_page():
+    """Show dataset history and comparison"""
+    st.markdown('<h1 class="main-header">📈 Dataset History & Comparison</h1>', unsafe_allow_html=True)
+    
+    # Get history
+    history = get_dataset_history(limit=20)
+    
+    if not history or "error" in history:
+        st.info("📭 No datasets uploaded yet. Upload your first dataset to get started!")
+        return
+    
+    st.markdown("### 📜 Your Dataset History")
+    
+    # History table
+    history_df = pd.DataFrame(history)
+    history_df['upload_date'] = pd.to_datetime(history_df['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
+    
+    st.dataframe(
+        history_df[['filename', 'upload_date', 'total_customers', 'churn_rate', 'revenue_at_risk']],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "filename": "Dataset",
+            "upload_date": "Upload Date",
+            "total_customers": st.column_config.NumberColumn("Customers", format="%d"),
+            "churn_rate": st.column_config.NumberColumn("Churn Rate %", format="%.1f%%"),
+            "revenue_at_risk": st.column_config.NumberColumn("Revenue at Risk", format="$%.0f")
+        }
+    )
+    
+    st.markdown("---")
+    
+    # Comparison Section
+    if len(history) >= 2:
+        st.markdown("### 🔄 Compare Datasets")
+        
+        col1, col2 = st.columns(2)
+        
+        dataset_options = {f"{d['filename']} ({d['upload_date'][:10]})": d['id'] for d in history}
+        
+        with col1:
+            st.markdown("**Previous Dataset (Baseline)**")
+            prev_selection = st.selectbox(
+                "Select previous dataset",
+                options=list(dataset_options.keys()),
+                index=1 if len(history) > 1 else 0,
+                key="prev_dataset"
+            )
+        
+        with col2:
+            st.markdown("**Current Dataset**")
+            curr_selection = st.selectbox(
+                "Select current dataset",
+                options=list(dataset_options.keys()),
+                index=0,
+                key="curr_dataset"
+            )
+        
+        if st.button("📊 Compare Datasets", type="primary", use_container_width=True):
+            prev_id = dataset_options[prev_selection]
+            curr_id = dataset_options[curr_selection]
+            
+            if prev_id == curr_id:
+                st.warning("Please select different datasets to compare")
+            else:
+                with st.spinner("Comparing datasets..."):
+                    comparison = compare_datasets(prev_id, curr_id)
+                
+                if comparison and "error" not in comparison:
+                    show_comparison_results(comparison)
+                else:
+                    st.error("Failed to compare datasets")
+        
+        # Auto-compare with latest
+        st.markdown("---")
+        st.markdown("### ⚡ Quick Comparison (Latest vs Previous)")
+        
+        if st.button("Compare Latest Upload with Previous", use_container_width=True):
+            with st.spinner("Comparing..."):
+                comparison = compare_latest_datasets()
+            
+            if comparison and "error" not in comparison:
+                show_comparison_results(comparison)
+            elif comparison is None:
+                st.info("Need at least 2 datasets to compare")
+            else:
+                st.error("Failed to compare datasets")
+    else:
+        st.info("📊 Upload at least 2 datasets to enable comparison features")
+
+
+def show_comparison_results(comparison):
+    """Display comparison results with profit/loss"""
+    st.markdown("---")
+    st.markdown("### 📊 Comparison Results")
+    
+    # Profit/Loss Banner
+    is_improvement = comparison.get('is_improvement', False)
+    profit_loss = comparison.get('profit_loss_amount', 0)
+    
+    if is_improvement:
+        st.success(f"""
+        ### 🎉 IMPROVEMENT DETECTED!
+        **Estimated Annual Profit: ${profit_loss:,.2f}**
+        
+        Your retention efforts are working! Churn rate has decreased.
+        """)
+    else:
+        st.error(f"""
+        ### ⚠️ ATTENTION NEEDED
+        **Estimated Annual Loss: ${abs(profit_loss):,.2f}**
+        
+        Churn rate has increased. Consider reviewing retention strategies.
+        """)
+    
+    # Metrics comparison
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        change = comparison.get('customer_change', 0)
+        st.metric("Customer Change", f"{change:+,}", delta_color="normal")
+    
+    with col2:
+        change = comparison.get('churn_rate_change', 0)
+        st.metric("Churn Rate Change", f"{change:+.1f}%", delta=f"{-change:.1f}%", delta_color="inverse")
+    
+    with col3:
+        change = comparison.get('revenue_change', 0)
+        st.metric("Revenue Change", f"${change:+,.0f}")
+    
+    with col4:
+        change = comparison.get('risk_change', 0)
+        st.metric("Risk Change", f"${change:+,.0f}", delta_color="inverse")
+    
+    # Detailed comparison
+    detailed = comparison.get('detailed_comparison', {})
+    
+    if detailed:
+        st.markdown("### 📋 Detailed Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"**📅 {comparison.get('dataset_1_filename', 'Previous')}**")
+            period_1 = detailed.get('period_1', {})
+            st.write(f"- Customers: {period_1.get('customers', 0):,}")
+            st.write(f"- Revenue: ${period_1.get('revenue', 0):,.0f}")
+            st.write(f"- Churn Rate: {period_1.get('churn_rate', 0):.1f}%")
+            st.write(f"- At Risk: ${period_1.get('revenue_at_risk', 0):,.0f}")
+        
+        with col2:
+            st.markdown(f"**📅 {comparison.get('dataset_2_filename', 'Current')}**")
+            period_2 = detailed.get('period_2', {})
+            st.write(f"- Customers: {period_2.get('customers', 0):,}")
+            st.write(f"- Revenue: ${period_2.get('revenue', 0):,.0f}")
+            st.write(f"- Churn Rate: {period_2.get('churn_rate', 0):.1f}%")
+            st.write(f"- At Risk: ${period_2.get('revenue_at_risk', 0):,.0f}")
+        
+        # Insights
+        insights = detailed.get('insights', [])
+        if insights:
+            st.markdown("### 💡 Insights")
+            for insight in insights:
+                st.markdown(f"- {insight}")
+
+
+# ============================================================================
+# PAGE: DASHBOARD (Original)
+# ============================================================================
+
 @st.cache_data(ttl=300)
 def load_data():
     """Load customer data from CSV"""
     try:
-        df = pd.read_csv(r"c:\Users\KIIT0001\Desktop\churn-prediction-analytics\data\processed\customer_predictions.csv")
+        df = pd.read_csv(PREDICTIONS_FILE)
         return df
-    except:
+    except Exception as e:
         return None
 
-def get_prediction(customer_data):
-    """Get churn prediction from API"""
-    try:
-        response = requests.post(f"{API_URL}/predict", json=customer_data, timeout=5)
-        if response.status_code == 200:
-            return response.json()
-    except:
-        pass
-    return None
 
-# Sidebar Navigation
-st.sidebar.markdown("## 🎯 Navigation")
-page = st.sidebar.radio(
-    "Select Page",
-    ["📊 Dashboard", "👥 Customers", "🔮 Predict Churn", "🎯 Retention Actions", "📈 Model Performance"]
-)
-
-# Load Data
-data = load_data()
-
-# ================== DASHBOARD PAGE ==================
-if page == "📊 Dashboard":
+def show_dashboard_page():
+    """Show main dashboard"""
     st.markdown('<h1 class="main-header">📊 Customer Churn Dashboard</h1>', unsafe_allow_html=True)
+    
+    data = load_data()
     
     if data is not None:
         # KPI Metrics Row
@@ -107,7 +600,7 @@ if page == "📊 Dashboard":
             st.subheader("📊 Risk Distribution")
             if 'Churn_Probability' in data.columns:
                 data['Risk_Level'] = pd.cut(
-                    data['Churn_Probability'], 
+                    data['Churn_Probability'],
                     bins=[0, 0.3, 0.5, 0.7, 1.0],
                     labels=['Low', 'Medium', 'High', 'Critical']
                 )
@@ -120,10 +613,8 @@ if page == "📊 Dashboard":
                 names=risk_counts.index,
                 color=risk_counts.index,
                 color_discrete_map={
-                    'Low': '#2ecc71',
-                    'Medium': '#f1c40f',
-                    'High': '#f39c12',
-                    'Critical': '#e74c3c'
+                    'Low': '#2ecc71', 'Medium': '#f1c40f',
+                    'High': '#f39c12', 'Critical': '#e74c3c'
                 },
                 hole=0.4
             )
@@ -135,103 +626,66 @@ if page == "📊 Dashboard":
             if 'Contract' in data.columns:
                 contract_counts = data.groupby('Contract').size().reset_index(name='Count')
                 fig_contract = px.bar(
-                    contract_counts,
-                    x='Contract',
-                    y='Count',
-                    color='Contract',
+                    contract_counts, x='Contract', y='Count', color='Contract',
                     color_discrete_sequence=['#3498db', '#2ecc71', '#9b59b6']
                 )
                 fig_contract.update_layout(margin=dict(t=20, b=20, l=20, r=20), showlegend=False)
                 st.plotly_chart(fig_contract, use_container_width=True)
-        
-        # Second Row
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("💰 Customer Segments")
-            if 'Segment' in data.columns:
-                segment_counts = data['Segment'].value_counts()
-                fig_segment = px.bar(
-                    x=segment_counts.values,
-                    y=segment_counts.index,
-                    orientation='h',
-                    color=segment_counts.index,
-                    color_discrete_map={
-                        'Low Risk, High Value': '#2ecc71',
-                        'Low Risk, Low Value': '#3498db',
-                        'High Risk, Low Value': '#f39c12',
-                        'High Risk, High Value': '#e74c3c'
-                    }
-                )
-                fig_segment.update_layout(showlegend=False, margin=dict(t=20, b=20, l=20, r=20))
-                st.plotly_chart(fig_segment, use_container_width=True)
-        
-        with col2:
-            st.subheader("📉 Churn Probability Distribution")
-            if 'Churn_Probability' in data.columns:
-                fig_hist = px.histogram(
-                    data, x='Churn_Probability', nbins=30,
-                    color_discrete_sequence=['#3498db']
-                )
-                fig_hist.add_vline(x=0.5, line_dash="dash", line_color="red")
-                fig_hist.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-                st.plotly_chart(fig_hist, use_container_width=True)
     else:
-        st.error("❌ Could not load data. Make sure customer_predictions.csv exists.")
+        st.warning("📊 No local data available. Upload a dataset to get started!")
 
-# ================== CUSTOMERS PAGE ==================
-elif page == "👥 Customers":
-    st.markdown('<h1 class="main-header">👥 Customer Explorer</h1>', unsafe_allow_html=True)
+
+# ============================================================================
+# SIDEBAR & NAVIGATION
+# ============================================================================
+
+def main():
+    """Main application entry point"""
     
-    if data is not None:
-        # Filters
-        col1, col2, col3 = st.columns(3)
+    # Sidebar
+    st.sidebar.markdown("## 🎯 Churn Prediction")
+    
+    if st.session_state.authenticated:
+        # User info
+        user = st.session_state.user or {}
+        st.sidebar.markdown(f"👤 **{user.get('username', 'User')}**")
+        st.sidebar.markdown(f"📧 {user.get('email', '')}")
         
-        with col1:
-            if 'Churn_Probability' in data.columns:
-                data['Risk_Level'] = pd.cut(
-                    data['Churn_Probability'],
-                    bins=[0, 0.3, 0.5, 0.7, 1.0],
-                    labels=['Low', 'Medium', 'High', 'Critical']
-                )
-            risk_filter = st.selectbox("Risk Level", ["All", "Critical", "High", "Medium", "Low"])
+        if st.sidebar.button("🚪 Logout", use_container_width=True):
+            logout_user()
+            st.rerun()
         
-        with col2:
-            contracts = ["All"] + list(data['Contract'].unique()) if 'Contract' in data.columns else ["All"]
-            contract_filter = st.selectbox("Contract Type", contracts)
+        st.sidebar.markdown("---")
         
-        with col3:
-            search_id = st.text_input("Search Customer ID", "")
+        # Navigation
+        page = st.sidebar.radio(
+            "Navigate",
+            ["📊 Dashboard", "📤 Upload Dataset", "📈 History & Compare", "🔮 Quick Predict"]
+        )
         
-        # Apply Filters
-        filtered = data.copy()
-        
-        if risk_filter != "All" and 'Risk_Level' in filtered.columns:
-            filtered = filtered[filtered['Risk_Level'] == risk_filter]
-        
-        if contract_filter != "All" and 'Contract' in filtered.columns:
-            filtered = filtered[filtered['Contract'] == contract_filter]
-        
-        if search_id:
-            filtered = filtered[filtered['CustomerID'].astype(str).str.contains(search_id, case=False)]
-        
-        st.markdown(f"**Showing {len(filtered):,} of {len(data):,} customers**")
-        
-        # Display Table
-        cols = ['CustomerID', 'Gender', 'Contract', 'Tenure', 'MonthlyCharges', 'TotalCharges']
-        if 'Churn_Probability' in filtered.columns:
-            cols.append('Churn_Probability')
-        if 'Segment' in filtered.columns:
-            cols.append('Segment')
-        
-        available = [c for c in cols if c in filtered.columns]
-        st.dataframe(filtered[available].head(100), use_container_width=True, hide_index=True)
+        if page == "📊 Dashboard":
+            show_dashboard_page()
+        elif page == "📤 Upload Dataset":
+            show_upload_page()
+        elif page == "📈 History & Compare":
+            show_comparison_page()
+        elif page == "🔮 Quick Predict":
+            show_quick_predict_page()
     else:
-        st.error("❌ Could not load customer data.")
+        show_auth_page()
+    
+    # Footer
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("<small>Built with ❤️ using Streamlit</small>", unsafe_allow_html=True)
 
-# ================== PREDICT PAGE ==================
-elif page == "🔮 Predict Churn":
-    st.markdown('<h1 class="main-header">🔮 Churn Prediction</h1>', unsafe_allow_html=True)
+
+# ============================================================================
+# PAGE: QUICK PREDICT (Single Customer)
+# ============================================================================
+
+def show_quick_predict_page():
+    """Show quick prediction form for single customer"""
+    st.markdown('<h1 class="main-header">🔮 Quick Churn Prediction</h1>', unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns(3)
     
@@ -256,49 +710,24 @@ elif page == "🔮 Predict Churn":
         payment = st.selectbox("Payment Method", [
             "Electronic check", "Mailed check", "Bank transfer (automatic)", "Credit card (automatic)"
         ])
-        paperless = st.selectbox("Paperless Billing", ["Yes", "No"])
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        tech_support = st.selectbox("Tech Support", ["No", "Yes"])
-    with col2:
-        online_security = st.selectbox("Online Security", ["No", "Yes"])
     
     if st.button("🔮 Predict Churn", type="primary", use_container_width=True):
-        customer_data = {
-            "Gender": gender,
-            "SeniorCitizen": 1 if senior == "Yes" else 0,
-            "Partner": partner,
-            "Dependents": dependents,
-            "Tenure": tenure,
-            "PhoneService": phone,
-            "InternetService": internet,
-            "TechSupport": tech_support,
-            "OnlineSecurity": online_security,
-            "Contract": contract,
-            "PaperlessBilling": paperless,
-            "PaymentMethod": payment,
-            "MonthlyCharges": monthly,
-            "TotalCharges": total
-        }
+        # Calculate prediction using heuristics
+        prob = 0.2
+        if contract == "Month-to-month":
+            prob += 0.3
+        if tenure < 12:
+            prob += 0.2
+        if internet == "Fiber optic":
+            prob += 0.1
+        if payment == "Electronic check":
+            prob += 0.1
+        prob = min(prob, 0.95)
         
-        result = get_prediction(customer_data)
+        risk = "Critical" if prob >= 0.7 else "High" if prob >= 0.5 else "Medium" if prob >= 0.3 else "Low"
         
         st.markdown("---")
         st.subheader("📊 Prediction Results")
-        
-        if result:
-            prob = result.get('churn_probability', 0.5)
-            risk = result.get('risk_level', 'Medium')
-        else:
-            # Fallback heuristic
-            prob = 0.2
-            if contract == "Month-to-month": prob += 0.3
-            if tenure < 12: prob += 0.2
-            if internet == "Fiber optic": prob += 0.1
-            if payment == "Electronic check": prob += 0.1
-            prob = min(prob, 0.95)
-            risk = "Critical" if prob >= 0.7 else "High" if prob >= 0.5 else "Medium" if prob >= 0.3 else "Low"
         
         col1, col2, col3 = st.columns(3)
         
@@ -339,81 +768,7 @@ elif page == "🔮 Predict Churn":
                 st.success("✅ LOW RISK")
                 st.write("• Continue standard engagement")
 
-# ================== RETENTION PAGE ==================
-elif page == "🎯 Retention Actions":
-    st.markdown('<h1 class="main-header">🎯 Retention Actions</h1>', unsafe_allow_html=True)
-    
-    try:
-        retention_df = pd.read_csv(
-            r"c:\Users\KIIT0001\Desktop\churn-prediction-analytics\data\processed\retention_actions.csv"
-        )
-        
-        col1, col2, col3 = st.columns(3)
-        priority_counts = retention_df['Priority'].value_counts()
-        
-        with col1:
-            st.metric("🔴 Critical", priority_counts.get('Critical', 0))
-        with col2:
-            st.metric("🟠 High", priority_counts.get('High', 0))
-        with col3:
-            st.metric("🟡 Medium", priority_counts.get('Medium', 0))
-        
-        st.markdown("---")
-        
-        priority_filter = st.selectbox("Filter by Priority", ["All", "Critical", "High", "Medium"])
-        
-        if priority_filter != "All":
-            retention_df = retention_df[retention_df['Priority'] == priority_filter]
-        
-        cols = ['CustomerID', 'Contract', 'Churn_Probability', 'Priority', 'Strategies']
-        available = [c for c in cols if c in retention_df.columns]
-        
-        st.dataframe(retention_df[available].head(50), use_container_width=True, hide_index=True)
-        
-        st.download_button(
-            "📥 Download CSV",
-            retention_df[available].to_csv(index=False),
-            "retention_actions.csv",
-            use_container_width=True
-        )
-    except:
-        st.warning("⚠️ No retention data found. Run the modeling notebook first.")
 
-# ================== MODEL PERFORMANCE PAGE ==================
-elif page == "📈 Model Performance":
-    st.markdown('<h1 class="main-header">📈 Model Performance</h1>', unsafe_allow_html=True)
-    
-    try:
-        model_df = pd.read_csv(
-            r"c:\Users\KIIT0001\Desktop\churn-prediction-analytics\data\processed\model_comparison.csv"
-        )
-        
-        best = model_df.loc[model_df['ROC-AUC'].idxmax(), 'Model']
-        st.success(f"**🏆 Best Model:** {best}")
-        
-        st.dataframe(model_df, use_container_width=True, hide_index=True)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📊 ROC-AUC Comparison")
-            fig = px.bar(model_df, x='Model', y='ROC-AUC', color='ROC-AUC',
-                        color_continuous_scale='RdYlGn')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("🔑 Feature Importance")
-            features = pd.DataFrame({
-                'Feature': ['Contract', 'Tenure', 'MonthlyCharges', 'InternetService', 
-                           'PaymentMethod', 'TechSupport', 'TotalCharges'],
-                'Importance': [0.25, 0.18, 0.12, 0.10, 0.08, 0.07, 0.06]
-            })
-            fig = px.bar(features, x='Importance', y='Feature', orientation='h',
-                        color='Importance', color_continuous_scale='Blues')
-            st.plotly_chart(fig, use_container_width=True)
-    except:
-        st.warning("⚠️ No model data found. Run the modeling notebook first.")
-
-# Footer
-st.markdown("---")
-st.markdown("<center>📊 Customer Churn Dashboard | Built with Streamlit</center>", unsafe_allow_html=True)
+# Run the app
+if __name__ == "__main__":
+    main()
