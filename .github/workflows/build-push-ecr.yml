@@ -8,9 +8,9 @@ on:
   workflow_dispatch:  # Manual trigger
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ap-south-2
   AWS_ACCOUNT_ID: 269809345078
-  ECR_REGISTRY: 269809345078.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REGISTRY: 269809345078.dkr.ecr.ap-south-2.amazonaws.com
 
 jobs:
   # ============================================================================

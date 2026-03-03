@@ -79,6 +79,71 @@ if 'user' not in st.session_state:
     st.session_state.user = None
 if 'current_analysis' not in st.session_state:
     st.session_state.current_analysis = None
+# Persist the uploaded DataFrame so it survives page switches
+if 'uploaded_df' not in st.session_state:
+    st.session_state.uploaded_df = None
+if 'uploaded_filename' not in st.session_state:
+    st.session_state.uploaded_filename = None
+# Store all uploaded datasets for history & comparison (list of dicts)
+if 'dataset_history' not in st.session_state:
+    st.session_state.dataset_history = []
+# Store DataFrames uploaded specifically for comparison
+if 'comparison_datasets' not in st.session_state:
+    st.session_state.comparison_datasets = {}
+
+
+# ============================================================================
+# LOCAL ANALYSIS HELPERS
+# ============================================================================
+
+def analyze_dataframe(df, filename="dataset"):
+    """Perform churn analysis locally on a DataFrame.
+    Works whether the data already has Churn_Probability or not.
+    Returns a dict similar to the API response.
+    """
+    total_customers = len(df)
+
+    # --- Churn probability ---------------------------------------------------
+    if 'Churn_Probability' in df.columns:
+        churn_prob = df['Churn_Probability']
+    elif 'Churn' in df.columns:
+        # Derive a simple probability from actual churn label
+        churn_prob = df['Churn'].map({'Yes': 0.85, 'No': 0.15, 1: 0.85, 0: 0.15}).fillna(0.5)
+    else:
+        churn_prob = pd.Series([0.5] * total_customers)
+
+    churn_rate = float(churn_prob.mean() * 100)
+    high_risk_count = int((churn_prob >= 0.7).sum())
+
+    # Revenue at risk
+    if 'MonthlyCharges' in df.columns:
+        revenue_at_risk = float(df.loc[churn_prob >= 0.5, 'MonthlyCharges'].sum())
+        total_revenue = float(df['MonthlyCharges'].sum())
+    else:
+        revenue_at_risk = 0.0
+        total_revenue = 0.0
+
+    # Segment stats
+    bins = [0, 0.3, 0.5, 0.7, 1.01]
+    labels = ['Low', 'Medium', 'High', 'Critical']
+    risk_levels = pd.cut(churn_prob, bins=bins, labels=labels, include_lowest=True)
+    segment_stats = {}
+    for level in labels:
+        mask = risk_levels == level
+        count = int(mask.sum())
+        rev = float(df.loc[mask, 'MonthlyCharges'].sum()) if 'MonthlyCharges' in df.columns else 0
+        segment_stats[level] = {'count': count, 'revenue': rev}
+
+    return {
+        'filename': filename,
+        'total_customers': total_customers,
+        'churn_rate': churn_rate,
+        'high_risk_count': high_risk_count,
+        'revenue_at_risk': revenue_at_risk,
+        'total_revenue': total_revenue,
+        'segment_stats': segment_stats,
+        'upload_date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+    }
 
 
 # ============================================================================
@@ -165,23 +230,18 @@ def upload_dataset(file, description=None):
     """Upload dataset for analysis"""
     files = {"file": (file.name, file, "text/csv")}
     data = {"description": description} if description else {}
-    return api_request("POST", "/datasets/upload", data=data, files=files)
+    return api_request("POST", "/dataset/upload", data=data, files=files)
 
 
 def get_dataset_history(limit=10):
     """Get user's dataset upload history"""
-    return api_request("GET", f"/datasets/history?limit={limit}")
+    return api_request("GET", f"/dataset/?page=1&page_size={limit}")
 
 
-def compare_latest_datasets():
-    """Compare the latest two datasets"""
-    return api_request("GET", "/datasets/compare/latest")
-
-
-def compare_datasets(dataset_1_id, dataset_2_id):
-    """Compare two specific datasets"""
+def compare_datasets_api(dataset_1_id, dataset_2_id):
+    """Compare two specific datasets via backend API"""
     data = {"dataset_1_id": dataset_1_id, "dataset_2_id": dataset_2_id}
-    return api_request("POST", "/datasets/compare", data)
+    return api_request("POST", "/dataset/compare", data)
 
 
 # ============================================================================
@@ -254,10 +314,10 @@ def show_upload_page():
     
     st.markdown("""
     Upload your customer data in CSV format. The system will:
-    1. **Analyze** your dataset using our ML model
+    1. **Analyze** your dataset locally
     2. **Predict** churn probability for each customer
-    3. **Store** results for future comparison
-    4. **Compare** with previous uploads to track progress
+    3. **Store** results for future comparison across pages
+    4. **Compare** with other uploads to track progress
     """)
     
     st.markdown("---")
@@ -269,7 +329,8 @@ def show_upload_page():
         uploaded_file = st.file_uploader(
             "Upload Customer CSV",
             type=["csv"],
-            help="Upload a CSV file with customer data"
+            help="Upload a CSV file with customer data",
+            key="upload_page_file"
         )
         description = st.text_input(
             "Description (optional)",
@@ -299,175 +360,273 @@ def show_upload_page():
             st.dataframe(df_preview.head(10), use_container_width=True)
             st.info(f"📊 Total rows: {len(df_preview):,} | Columns: {len(df_preview.columns)}")
             
-            # Reset file pointer for upload
-            uploaded_file.seek(0)
-            
             if st.button("🚀 Analyze Dataset", type="primary", use_container_width=True):
                 with st.spinner("Analyzing dataset..."):
-                    result = upload_dataset(uploaded_file, description)
-                
-                if result and "error" not in result:
-                    st.session_state.current_analysis = result
-                    st.success("✅ Dataset analyzed successfully!")
-                    st.rerun()
-                elif result and "error" in result:
-                    st.error(f"❌ Error: {result['error']}")
-                else:
-                    st.error("❌ Failed to analyze dataset")
+                    # ----- LOCAL analysis (always works) -----
+                    analysis = analyze_dataframe(df_preview, filename=uploaded_file.name)
+
+                    # Persist the DataFrame & analysis in session state
+                    st.session_state.uploaded_df = df_preview
+                    st.session_state.uploaded_filename = uploaded_file.name
+                    st.session_state.current_analysis = analysis
+
+                    # Also add to history for the comparison page
+                    st.session_state.dataset_history.append({
+                        **analysis,
+                        'df': df_preview,
+                    })
+
+                st.success("✅ Dataset analyzed successfully!")
+                st.rerun()
         except Exception as e:
             st.error(f"❌ Error reading file: {e}")
+
+    # --- Still show the PREVIOUS analysis when file uploader is empty --------
+    elif st.session_state.uploaded_df is not None:
+        st.markdown("### 📋 Previously Loaded Data")
+        st.dataframe(st.session_state.uploaded_df.head(10), use_container_width=True)
+        st.info(
+            f"📊 Total rows: {len(st.session_state.uploaded_df):,} | "
+            f"Columns: {len(st.session_state.uploaded_df.columns)} | "
+            f"File: {st.session_state.uploaded_filename}"
+        )
     
     # Show Current Analysis Results
     if st.session_state.current_analysis:
-        analysis = st.session_state.current_analysis
-        
-        st.markdown("---")
-        st.markdown("### 📊 Analysis Results")
-        
-        # KPI Cards
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Customers", f"{analysis.get('total_customers', 0):,}")
-        with col2:
-            st.metric("Churn Rate", f"{analysis.get('churn_rate', 0):.1f}%")
-        with col3:
-            st.metric("High Risk", f"{analysis.get('high_risk_count', 0):,}")
-        with col4:
-            st.metric("Revenue at Risk", f"${analysis.get('revenue_at_risk', 0):,.0f}")
-        
-        # Risk Distribution
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("🎯 Risk Distribution")
-            segment_stats = analysis.get('segment_stats', {})
-            if segment_stats:
-                risk_data = pd.DataFrame([
-                    {"Risk Level": level, "Count": stats.get('count', 0)}
-                    for level, stats in segment_stats.items()
-                ])
-                fig = px.pie(
-                    risk_data, values='Count', names='Risk Level',
-                    color='Risk Level',
-                    color_discrete_map={
-                        'Low': '#2ecc71', 'Medium': '#f1c40f',
-                        'High': '#f39c12', 'Critical': '#e74c3c'
-                    },
-                    hole=0.4
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("📈 Key Insights")
-            churn_rate = analysis.get('churn_rate', 0)
-            if churn_rate > 30:
-                st.error(f"⚠️ High churn risk detected ({churn_rate:.1f}%)")
-                st.markdown("- Consider immediate retention campaigns")
-                st.markdown("- Review high-risk customer segments")
-            elif churn_rate > 15:
-                st.warning(f"⚡ Moderate churn risk ({churn_rate:.1f}%)")
-                st.markdown("- Monitor at-risk customers")
-                st.markdown("- Implement proactive engagement")
-            else:
-                st.success(f"✅ Low churn risk ({churn_rate:.1f}%)")
-                st.markdown("- Continue current strategies")
-                st.markdown("- Focus on customer satisfaction")
+        _render_analysis_results(st.session_state.current_analysis)
+
+
+def _render_analysis_results(analysis):
+    """Reusable widget to render analysis KPIs + charts."""
+    st.markdown("---")
+    st.markdown("### 📊 Analysis Results")
+    
+    # KPI Cards
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Customers", f"{analysis.get('total_customers', 0):,}")
+    with col2:
+        st.metric("Churn Rate", f"{analysis.get('churn_rate', 0):.1f}%")
+    with col3:
+        st.metric("High Risk", f"{analysis.get('high_risk_count', 0):,}")
+    with col4:
+        st.metric("Revenue at Risk", f"${analysis.get('revenue_at_risk', 0):,.0f}")
+    
+    # Risk Distribution
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🎯 Risk Distribution")
+        segment_stats = analysis.get('segment_stats', {})
+        if segment_stats:
+            risk_data = pd.DataFrame([
+                {"Risk Level": level, "Count": stats.get('count', 0)}
+                for level, stats in segment_stats.items()
+            ])
+            fig = px.pie(
+                risk_data, values='Count', names='Risk Level',
+                color='Risk Level',
+                color_discrete_map={
+                    'Low': '#2ecc71', 'Medium': '#f1c40f',
+                    'High': '#f39c12', 'Critical': '#e74c3c'
+                },
+                hole=0.4
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("📈 Key Insights")
+        churn_rate = analysis.get('churn_rate', 0)
+        if churn_rate > 30:
+            st.error(f"⚠️ High churn risk detected ({churn_rate:.1f}%)")
+            st.markdown("- Consider immediate retention campaigns")
+            st.markdown("- Review high-risk customer segments")
+        elif churn_rate > 15:
+            st.warning(f"⚡ Moderate churn risk ({churn_rate:.1f}%)")
+            st.markdown("- Monitor at-risk customers")
+            st.markdown("- Implement proactive engagement")
+        else:
+            st.success(f"✅ Low churn risk ({churn_rate:.1f}%)")
+            st.markdown("- Continue current strategies")
+            st.markdown("- Focus on customer satisfaction")
 
 
 # ============================================================================
-# PAGE: HISTORY & COMPARISON
+# PAGE: HISTORY & COMPARISON  (local multi-file upload)
 # ============================================================================
 
 def show_comparison_page():
-    """Show dataset history and comparison"""
-    st.markdown('<h1 class="main-header">📈 Dataset History & Comparison</h1>', unsafe_allow_html=True)
-    
-    # Get history
-    history = get_dataset_history(limit=20)
-    
-    if not history or "error" in history:
-        st.info("📭 No datasets uploaded yet. Upload your first dataset to get started!")
-        return
-    
-    st.markdown("### 📜 Your Dataset History")
-    
-    # History table
-    history_df = pd.DataFrame(history)
-    history_df['upload_date'] = pd.to_datetime(history_df['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
-    
-    st.dataframe(
-        history_df[['filename', 'upload_date', 'total_customers', 'churn_rate', 'revenue_at_risk']],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "filename": "Dataset",
-            "upload_date": "Upload Date",
-            "total_customers": st.column_config.NumberColumn("Customers", format="%d"),
-            "churn_rate": st.column_config.NumberColumn("Churn Rate %", format="%.1f%%"),
-            "revenue_at_risk": st.column_config.NumberColumn("Revenue at Risk", format="$%.0f")
-        }
-    )
-    
+    """Show dataset comparison with multi-file upload support."""
+    st.markdown('<h1 class="main-header">📈 Dataset Comparison</h1>', unsafe_allow_html=True)
+
+    st.markdown("""
+    Upload **two or more** CSV files to compare churn metrics side-by-side.
+    You can also re-use any dataset you already analyzed on the Upload page.
+    """)
+
     st.markdown("---")
-    
-    # Comparison Section
-    if len(history) >= 2:
-        st.markdown("### 🔄 Compare Datasets")
-        
-        col1, col2 = st.columns(2)
-        
-        dataset_options = {f"{d['filename']} ({d['upload_date'][:10]})": d['id'] for d in history}
-        
-        with col1:
-            st.markdown("**Previous Dataset (Baseline)**")
-            prev_selection = st.selectbox(
-                "Select previous dataset",
-                options=list(dataset_options.keys()),
-                index=1 if len(history) > 1 else 0,
-                key="prev_dataset"
-            )
-        
-        with col2:
-            st.markdown("**Current Dataset**")
-            curr_selection = st.selectbox(
-                "Select current dataset",
-                options=list(dataset_options.keys()),
-                index=0,
-                key="curr_dataset"
-            )
-        
-        if st.button("📊 Compare Datasets", type="primary", use_container_width=True):
-            prev_id = dataset_options[prev_selection]
-            curr_id = dataset_options[curr_selection]
-            
-            if prev_id == curr_id:
-                st.warning("Please select different datasets to compare")
-            else:
-                with st.spinner("Comparing datasets..."):
-                    comparison = compare_datasets(prev_id, curr_id)
-                
-                if comparison and "error" not in comparison:
-                    show_comparison_results(comparison)
-                else:
-                    st.error("Failed to compare datasets")
-        
-        # Auto-compare with latest
-        st.markdown("---")
-        st.markdown("### ⚡ Quick Comparison (Latest vs Previous)")
-        
-        if st.button("Compare Latest Upload with Previous", use_container_width=True):
-            with st.spinner("Comparing..."):
-                comparison = compare_latest_datasets()
-            
-            if comparison and "error" not in comparison:
-                show_comparison_results(comparison)
-            elif comparison is None:
-                st.info("Need at least 2 datasets to compare")
-            else:
-                st.error("Failed to compare datasets")
+
+    # ----- Multi-file uploader ------------------------------------------------
+    comparison_files = st.file_uploader(
+        "Upload CSV files for comparison",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="Select two or more customer CSV files to compare",
+        key="comparison_uploader",
+    )
+
+    if comparison_files:
+        new_datasets = {}
+        for f in comparison_files:
+            try:
+                df = pd.read_csv(f)
+                new_datasets[f.name] = df
+            except Exception as e:
+                st.error(f"❌ Error reading {f.name}: {e}")
+
+        if new_datasets:
+            st.session_state.comparison_datasets = new_datasets
+            st.success(f"✅ Loaded {len(new_datasets)} dataset(s)")
+
+    # Also include datasets from the Upload page history
+    for item in st.session_state.dataset_history:
+        name = item.get('filename', 'unknown')
+        if name not in st.session_state.comparison_datasets and 'df' in item:
+            st.session_state.comparison_datasets[name] = item['df']
+
+    datasets = st.session_state.comparison_datasets
+
+    if not datasets:
+        st.info("📭 No datasets available yet.  Upload files above or analyze a dataset on the **Upload** page first.")
+        return
+
+    # ----- Show loaded dataset names ------------------------------------------
+    st.markdown("### 📂 Loaded Datasets")
+    for name, df in datasets.items():
+        st.write(f"- **{name}** — {len(df):,} rows, {len(df.columns)} columns")
+
+    st.markdown("---")
+
+    if len(datasets) < 2:
+        st.warning("⚠️ Upload at least **2 datasets** to enable comparison.")
+        # Still show single-dataset analysis
+        name, df = list(datasets.items())[0]
+        st.markdown(f"### 📊 Analysis: {name}")
+        _render_analysis_results(analyze_dataframe(df, name))
+        return
+
+    # ----- Let user choose which two to compare ------------------------------
+    dataset_names = list(datasets.keys())
+
+    col1, col2 = st.columns(2)
+    with col1:
+        baseline_name = st.selectbox(
+            "Baseline Dataset (older / reference)",
+            options=dataset_names,
+            index=0,
+            key="cmp_baseline",
+        )
+    with col2:
+        current_name = st.selectbox(
+            "Current Dataset (newer)",
+            options=dataset_names,
+            index=min(1, len(dataset_names) - 1),
+            key="cmp_current",
+        )
+
+    if baseline_name == current_name:
+        st.warning("Please select **different** datasets for comparison.")
+        return
+
+    if st.button("📊 Compare Datasets", type="primary", use_container_width=True):
+        with st.spinner("Comparing…"):
+            a1 = analyze_dataframe(datasets[baseline_name], baseline_name)
+            a2 = analyze_dataframe(datasets[current_name], current_name)
+            comparison = _build_local_comparison(a1, a2)
+        show_comparison_results(comparison)
+
+    # ----- Overview table of ALL loaded datasets ------------------------------
+    st.markdown("---")
+    st.markdown("### 📊 All Datasets Overview")
+    overview_rows = []
+    for name, df in datasets.items():
+        a = analyze_dataframe(df, name)
+        overview_rows.append({
+            'Dataset': a['filename'],
+            'Customers': a['total_customers'],
+            'Churn Rate %': round(a['churn_rate'], 1),
+            'High Risk': a['high_risk_count'],
+            'Revenue at Risk ($)': round(a['revenue_at_risk'], 0),
+        })
+    st.dataframe(pd.DataFrame(overview_rows), use_container_width=True, hide_index=True)
+
+
+def _build_local_comparison(a1, a2):
+    """Build a comparison dict from two local analysis dicts."""
+    churn_change = a2['churn_rate'] - a1['churn_rate']
+    customer_change = a2['total_customers'] - a1['total_customers']
+    revenue_change = a2.get('total_revenue', 0) - a1.get('total_revenue', 0)
+    risk_change = a2['revenue_at_risk'] - a1['revenue_at_risk']
+    is_improvement = churn_change < 0
+    # Rough annualised P/L: saved revenue if churn drops, lost revenue otherwise
+    profit_loss = -risk_change * 12 if is_improvement else risk_change * 12
+
+    return {
+        'dataset_1_filename': a1['filename'],
+        'dataset_2_filename': a2['filename'],
+        'is_improvement': is_improvement,
+        'profit_loss_amount': abs(profit_loss) if is_improvement else -abs(profit_loss),
+        'customer_change': customer_change,
+        'churn_rate_change': churn_change,
+        'revenue_change': revenue_change,
+        'risk_change': risk_change,
+        'detailed_comparison': {
+            'period_1': {
+                'customers': a1['total_customers'],
+                'revenue': a1.get('total_revenue', 0),
+                'churn_rate': a1['churn_rate'],
+                'revenue_at_risk': a1['revenue_at_risk'],
+            },
+            'period_2': {
+                'customers': a2['total_customers'],
+                'revenue': a2.get('total_revenue', 0),
+                'churn_rate': a2['churn_rate'],
+                'revenue_at_risk': a2['revenue_at_risk'],
+            },
+            'insights': _generate_insights(a1, a2),
+        }
+    }
+
+
+def _generate_insights(a1, a2):
+    """Generate human-readable comparison insights."""
+    insights = []
+    churn_diff = a2['churn_rate'] - a1['churn_rate']
+    if churn_diff < -5:
+        insights.append(f"Churn rate dropped significantly by {abs(churn_diff):.1f} pp – great progress!")
+    elif churn_diff < 0:
+        insights.append(f"Churn rate improved by {abs(churn_diff):.1f} pp.")
+    elif churn_diff > 5:
+        insights.append(f"Churn rate increased sharply by {churn_diff:.1f} pp – investigate root causes.")
+    elif churn_diff > 0:
+        insights.append(f"Churn rate rose slightly by {churn_diff:.1f} pp.")
     else:
-        st.info("📊 Upload at least 2 datasets to enable comparison features")
+        insights.append("Churn rate is unchanged.")
+
+    cust_diff = a2['total_customers'] - a1['total_customers']
+    if cust_diff > 0:
+        insights.append(f"Customer base grew by {cust_diff:,}.")
+    elif cust_diff < 0:
+        insights.append(f"Customer base shrank by {abs(cust_diff):,}.")
+
+    risk_diff = a2['revenue_at_risk'] - a1['revenue_at_risk']
+    if risk_diff < 0:
+        insights.append(f"Revenue at risk decreased by ${abs(risk_diff):,.0f} – retention is working.")
+    elif risk_diff > 0:
+        insights.append(f"Revenue at risk increased by ${risk_diff:,.0f} – consider targeted campaigns.")
+
+    return insights
 
 
 def show_comparison_results(comparison):
@@ -549,90 +708,151 @@ def show_comparison_results(comparison):
 # PAGE: DASHBOARD (Original)
 # ============================================================================
 
-@st.cache_data(ttl=300)
-def load_data():
-    """Load customer data from CSV"""
+def _load_default_data():
+    """Load default customer predictions CSV if it exists."""
     try:
-        df = pd.read_csv(PREDICTIONS_FILE)
-        return df
-    except Exception as e:
-        return None
+        if PREDICTIONS_FILE.exists():
+            return pd.read_csv(PREDICTIONS_FILE)
+    except Exception:
+        pass
+    return None
 
 
 def show_dashboard_page():
-    """Show main dashboard"""
+    """Show main dashboard – uses uploaded data first, falls back to default CSV."""
     st.markdown('<h1 class="main-header">📊 Customer Churn Dashboard</h1>', unsafe_allow_html=True)
-    
-    data = load_data()
-    
-    if data is not None:
-        # KPI Metrics Row
-        col1, col2, col3, col4 = st.columns(4)
-        
-        total_customers = len(data)
-        
-        if 'Churn_Probability' in data.columns:
-            high_risk = (data['Churn_Probability'] >= 0.7).sum()
-            critical_risk = (data['Churn_Probability'] >= 0.5).sum()
-            revenue_at_risk = data[data['Churn_Probability'] >= 0.5]['MonthlyCharges'].sum()
-            churn_rate = data['Churn_Probability'].mean() * 100
-        else:
-            high_risk = int(total_customers * 0.15)
-            critical_risk = int(total_customers * 0.25)
-            revenue_at_risk = 211661
-            churn_rate = 26.5
-        
-        with col1:
-            st.metric("Total Customers", f"{total_customers:,}")
-        with col2:
-            st.metric("Avg Churn Risk", f"{churn_rate:.1f}%")
-        with col3:
-            st.metric("High Risk Customers", f"{high_risk:,}")
-        with col4:
-            st.metric("Monthly Revenue at Risk", f"${revenue_at_risk:,.0f}")
-        
-        st.markdown("---")
-        
-        # Charts Row
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📊 Risk Distribution")
-            if 'Churn_Probability' in data.columns:
-                data['Risk_Level'] = pd.cut(
-                    data['Churn_Probability'],
-                    bins=[0, 0.3, 0.5, 0.7, 1.0],
-                    labels=['Low', 'Medium', 'High', 'Critical']
-                )
-                risk_counts = data['Risk_Level'].value_counts().reindex(['Low', 'Medium', 'High', 'Critical'])
-            else:
-                risk_counts = pd.Series({'Low': 3500, 'Medium': 1800, 'High': 1200, 'Critical': 543})
-            
-            fig_risk = px.pie(
-                values=risk_counts.values,
-                names=risk_counts.index,
-                color=risk_counts.index,
-                color_discrete_map={
-                    'Low': '#2ecc71', 'Medium': '#f1c40f',
-                    'High': '#f39c12', 'Critical': '#e74c3c'
-                },
-                hole=0.4
-            )
-            fig_risk.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-            st.plotly_chart(fig_risk, use_container_width=True)
-        
-        with col2:
-            st.subheader("📈 Churn by Contract Type")
-            if 'Contract' in data.columns:
-                contract_counts = data.groupby('Contract').size().reset_index(name='Count')
-                fig_contract = px.bar(
-                    contract_counts, x='Contract', y='Count', color='Contract',
-                    color_discrete_sequence=['#3498db', '#2ecc71', '#9b59b6']
-                )
-                fig_contract.update_layout(margin=dict(t=20, b=20, l=20, r=20), showlegend=False)
-                st.plotly_chart(fig_contract, use_container_width=True)
+
+    # ---- Inline uploader so users can load data directly on the dashboard ----
+    with st.expander("📂 Upload a dataset to analyse", expanded=(st.session_state.uploaded_df is None)):
+        dash_file = st.file_uploader(
+            "Drop a CSV here to view its dashboard",
+            type=["csv"],
+            key="dashboard_file_uploader",
+        )
+        if dash_file is not None:
+            try:
+                df_new = pd.read_csv(dash_file)
+                st.session_state.uploaded_df = df_new
+                st.session_state.uploaded_filename = dash_file.name
+                # Run local analysis and store it
+                analysis = analyze_dataframe(df_new, filename=dash_file.name)
+                st.session_state.current_analysis = analysis
+                st.session_state.dataset_history.append({**analysis, "df": df_new})
+                st.success(f"✅ Loaded **{dash_file.name}** ({len(df_new):,} rows)")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Could not read file: {e}")
+
+    # Determine which DataFrame to display
+    if st.session_state.uploaded_df is not None:
+        data = st.session_state.uploaded_df
+        source_label = f"Uploaded: {st.session_state.uploaded_filename}"
     else:
-        st.warning("📊 No local data available. Upload a dataset to get started!")
+        data = _load_default_data()
+        source_label = "Default sample data"
+
+    if data is None or data.empty:
+        st.info("📊 No data loaded yet. Use the uploader above or go to **Upload Dataset** to load a CSV file.")
+        return
+
+    st.caption(f"📁 Data source: **{source_label}** ({len(data):,} rows)")
+
+    # --- KPI Metrics Row ---
+    col1, col2, col3, col4 = st.columns(4)
+    total_customers = len(data)
+
+    if 'Churn_Probability' in data.columns:
+        churn_prob = data['Churn_Probability']
+    elif 'Churn' in data.columns:
+        churn_prob = data['Churn'].map({'Yes': 0.85, 'No': 0.15, 1: 0.85, 0: 0.15}).fillna(0.5)
+    else:
+        churn_prob = pd.Series([0.5] * total_customers)
+
+    high_risk = int((churn_prob >= 0.7).sum())
+    critical_risk = int((churn_prob >= 0.5).sum())
+    revenue_at_risk = float(data.loc[churn_prob >= 0.5, 'MonthlyCharges'].sum()) if 'MonthlyCharges' in data.columns else 0
+    churn_rate = float(churn_prob.mean() * 100)
+
+    with col1:
+        st.metric("Total Customers", f"{total_customers:,}")
+    with col2:
+        st.metric("Avg Churn Risk", f"{churn_rate:.1f}%")
+    with col3:
+        st.metric("High Risk Customers", f"{high_risk:,}")
+    with col4:
+        st.metric("Monthly Revenue at Risk", f"${revenue_at_risk:,.0f}")
+
+    st.markdown("---")
+
+    # --- Charts Row ---
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📊 Risk Distribution")
+        risk_levels = pd.cut(
+            churn_prob,
+            bins=[0, 0.3, 0.5, 0.7, 1.01],
+            labels=['Low', 'Medium', 'High', 'Critical'],
+            include_lowest=True,
+        )
+        risk_counts = risk_levels.value_counts().reindex(['Low', 'Medium', 'High', 'Critical']).fillna(0)
+
+        fig_risk = px.pie(
+            values=risk_counts.values,
+            names=risk_counts.index,
+            color=risk_counts.index,
+            color_discrete_map={
+                'Low': '#2ecc71', 'Medium': '#f1c40f',
+                'High': '#f39c12', 'Critical': '#e74c3c'
+            },
+            hole=0.4
+        )
+        fig_risk.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+    with col2:
+        st.subheader("📈 Churn by Contract Type")
+        if 'Contract' in data.columns:
+            contract_counts = data.groupby('Contract').size().reset_index(name='Count')
+            fig_contract = px.bar(
+                contract_counts, x='Contract', y='Count', color='Contract',
+                color_discrete_sequence=['#3498db', '#2ecc71', '#9b59b6']
+            )
+            fig_contract.update_layout(margin=dict(t=20, b=20, l=20, r=20), showlegend=False)
+            st.plotly_chart(fig_contract, use_container_width=True)
+        else:
+            st.info("Contract column not found in dataset.")
+
+    # --- Additional analytics charts ---
+    st.markdown("---")
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader("💰 Monthly Charges Distribution")
+        if 'MonthlyCharges' in data.columns:
+            fig_charges = px.histogram(
+                data, x='MonthlyCharges', nbins=30,
+                color_discrete_sequence=['#1f77b4'],
+                labels={'MonthlyCharges': 'Monthly Charges ($)'},
+            )
+            fig_charges.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig_charges, use_container_width=True)
+
+    with col4:
+        st.subheader("📅 Tenure Distribution")
+        if 'Tenure' in data.columns:
+            fig_tenure = px.histogram(
+                data, x='Tenure', nbins=20,
+                color_discrete_sequence=['#9b59b6'],
+                labels={'Tenure': 'Tenure (months)'},
+            )
+            fig_tenure.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig_tenure, use_container_width=True)
+
+    # --- Data table ---
+    st.markdown("---")
+    st.subheader("🔍 Customer Data Preview")
+    st.dataframe(data.head(50), use_container_width=True)
 
 
 # ============================================================================
