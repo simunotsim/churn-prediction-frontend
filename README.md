@@ -2,6 +2,15 @@
 
 Interactive Streamlit dashboard with user authentication, dynamic dataset upload, and profit/loss comparison analytics.
 
+## 🌐 Live Deployment (AWS ECS — ap-south-2 Hyderabad)
+
+| Service | URL |
+|---------|-----|
+| **Live Dashboard** | http://churn-prediction-alb-1924366152.ap-south-2.elb.amazonaws.com |
+| **Backend API Docs** | http://churn-prediction-alb-1924366152.ap-south-2.elb.amazonaws.com/docs |
+
+> Deployed on **Amazon ECS Fargate** (`churn-prediction-cluster`) behind an Application Load Balancer. Connects to the FastAPI backend running in the same ECS cluster.
+
 ## ✨ Key Features
 
 - 🔐 **User Authentication** - Register/Login with secure JWT tokens
